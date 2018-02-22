@@ -1,0 +1,128 @@
+iptables and TFTP HOWTO
+Posted on December 10, 2016 by beaveryoga
+
+Reminder to self on iptables and TFTP HOWTO.
+TL;DR
+
+iptables on a TFTP server:
+
+iptables -I INPUT -j ACCEPT -p udp -m udp --dport 69
+
+iptables on a TFTP client:
+
+## nf_conntrack_helper = 0 is the default nowadays
+## you need CT target for helpers to work
+echo 0 > /proc/sys/net/netfilter/nf_conntrack_helper
+modprobe nf_conntrack_tftp
+##
+iptables -t raw -I OUTPUT -j CT -p udp -m udp --dport 69 --helper tftp
+
+iptables on NAT/router between TFTP client and server; optionally, iptables does NAT for client:
+
+modprobe nf_nat_tftp
+iptables -t raw -I PREROUTING -j CT -p udp -m udp --dport 69 --helper tftp
+More verbose…
+iptables on TFTP server
+
+Exemplary INPUT chain on RHEL 7:
+
+
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+pkts bytes target prot opt in out source destination
+166M 192G ACCEPT all -- * * 0.0.0.0/0 0.0.0.0/0 ctstate RELATED,ESTABLISHED
+765K 46M ACCEPT all -- lo * 0.0.0.0/0 0.0.0.0/0
+33M 1962M INPUT_direct all -- * * 0.0.0.0/0 0.0.0.0/0
+33M 1962M INPUT_ZONES_SOURCE all -- * * 0.0.0.0/0 0.0.0.0/0
+33M 1962M INPUT_ZONES all -- * * 0.0.0.0/0 0.0.0.0/0
+288 22872 ACCEPT icmp -- * * 0.0.0.0/0 0.0.0.0/0
+47541 6359K REJECT all -- * * 0.0.0.0/0 0.0.0.0/0 reject-with icmp-host-prohibited
+
+Enable tftp server:
+firewall-cmd --zone=$INZONE --enable-service tftp
+## OR
+## iptables -I INPUT 2 -j ACCEPT -p udp -m udp --dport 69
+
+Verify:
+
+iptables --list -n -v
+## in firewalld this ends up in IN_$INZONE_allow chain
+Chain IN_$INZONE_allow (1 references)
+pkts bytes target prot opt in out source destination
+240 14341 ACCEPT udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:69 ctstate NEW
+iptables on TFTP client
+
+Exemplary -t raw OUTPUT chain on RHEL 7:
+
+iptables -t raw --list OUTPUT -n -v
+Chain OUTPUT (policy ACCEPT 14196 packets, 1824K bytes)
+pkts bytes target prot opt in out source destination
+112K 5213K OUTPUT_direct all -- * * 0.0.0.0/0 0.0.0.0/0
+
+Enable TFTP:
+
+firewall-cmd --direct --add-rule ipv4 raw OUTPUT 0 -j CT -p udp -m udp --dport 69 --helper tftp
+## OR
+## iptables -t raw -I OUTPUT -j CT -p udp -m udp --dport 69 --helper tftp
+
+Verify:
+
+## firewalld
+# iptables -t raw --list OUTPUT_direct -n -v
+Chain OUTPUT_direct (1 references)
+pkts bytes target prot opt in out source destination
+6 357 CT udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:69 CT helper tftp
+
+# perform a TFTP transaction to view connection/expectation
+# 192.168.1.7 is the client; 192.168.1.6 is the server
+# conntrack -L | grep ^udp.*192.168.1.6
+conntrack v1.4.3 (conntrack-tools): 24 flow entries have been shown.
+
+## this is the expectation, setup by tftp helper
+udp 17 27 src=192.168.1.6 dst=192.168.1.7 sport=43709 dport=47512 src=192.168.1.7 dst=192.168.1.6 sport=47512 dport=43709 mark=0 secctx=system_u:object_r:unlabeled_t:s0 use=2
+
+## this is the connection
+udp 17 27 src=192.168.1.7 dst=192.168.1.6 sport=47512 dport=69 [UNREPLIED] src=192.168.1.6 dst=192.168.1.7 sport=69 dport=47512 mark=0 secctx=system_u:object_r:unlabeled_t:s0 helper=tftp use=2
+
+iptables on NAT/router between TFTP client and server
+
+    Server: 192.168.1.6
+    NAT/router: 192.168.1.7 ##configure iptables here
+    Client: 192.168.125.93
+
+Exemplary -t raw PREROUTING chain in RHEL 7:
+
+# iptables -t raw --list PREROUTING -n -v
+Chain PREROUTING (policy ACCEPT 17541 packets, 19M bytes)
+pkts bytes target prot opt in out source destination
+477K 176M PREROUTING_direct all -- * * 0.0.0.0/0 0.0.0.0/0
+477K 176M PREROUTING_ZONES_SOURCE all -- * * 0.0.0.0/0 0.0.0.0/0
+477K 176M PREROUTING_ZONES all -- * * 0.0.0.0/0 0.0.0.0/0
+
+Enable TFTP:
+
+## we assume there are already rules for FORWARD/MASQUERADE
+firewall-cmd --zone=internal --enable-service tftp-client
+## OR
+## iptables -t raw -I PREROUTING -j CT -p udp -m udp --dport 69 --helper tftp
+
+Verify:
+
+# firewalld: the client is on the internal zone
+# iptables -t raw --list PRE_internal_allow -n -v
+Chain PRE_internal_allow (1 references)
+pkts bytes target prot opt in out source destination
+0 0 CT udp -- * * 0.0.0.0/0 0.0.0.0/0 udp dpt:69 CT helper tftp
+
+## perform a TFTP transaction...then
+# conntrack -L | grep ^udp.*192.168.1.6
+conntrack v1.4.3 (conntrack-tools): 21 flow entries have been shown.
+## this is the connection through the NAT+router
+udp 17 27 src=192.168.125.93 dst=192.168.1.6 sport=52718 dport=69 [UNREPLIED] src=192.168.1.6 dst=192.168.1.7 sport=69 dport=52718 mark=0 secctx=system_u:object_r:unlabeled_t:s0 helper=tftp use=2
+## this is the expectation setup by tftp helper
+udp 17 27 src=192.168.1.6 dst=192.168.1.7 sport=59356 dport=52718 src=192.168.125.93 dst=192.168.1.6 sport=52718 dport=59356 mark=0 secctx=system_u:object_r:unlabeled_t:s0 use=1
+
+    Note:
+
+    Expectations are installed in the reverse direction from the connection (that caused them)
+    TFTP Expectation dport = TFTP Connection sport
+    Recall that in TFTP the server makes a new connection from a random source port to the client port that was used to start the session to the server (69/udp)
